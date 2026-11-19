@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""Session-local Game Mode. Python standard library only; never controls GSR."""
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+OPTIONS = ('animations.enabled', 'decoration.blur.enabled', 'decoration.shadow.enabled')
+
+
+def command(*args):
+    p = subprocess.run(args, text=True, capture_output=True, timeout=8)
+    if p.returncode:
+        raise RuntimeError(f'{args[0]}: {p.stderr.strip() or p.stdout.strip()}')
+    return p.stdout.strip()
+
+
+def process(pid):
+    try:
+        root = Path('/proc') / str(pid)
+        stat = (root / 'stat').read_text().rsplit(')', 1)[1].split()
+        if root.stat().st_uid != os.getuid():
+            return None
+        return {'pid': int(pid), 'start': stat[19], 'state': stat[0],
+                'argv': (root / 'cmdline').read_bytes().decode().rstrip('\0').split('\0'),
+                'exe': os.readlink(root / 'exe')}
+    except (OSError, ValueError, UnicodeError):
+        return None
+
+
+def identity(p):
+    return {k: p[k] for k in ('pid', 'start', 'argv', 'exe')} if p else None
+
+
+class Desktop:
+    def __init__(self, runtime):
+        self.runtime = runtime
+
+    def session(self):
+        signature = os.environ.get('HYPRLAND_INSTANCE_SIGNATURE')
+        if not signature:
+            raise RuntimeError('Run inside your Hyprland terminal (missing session signature).')
+        command('hyprctl', 'version')
+        return Path('/proc/sys/kernel/random/boot_id').read_text().strip() + ':' + signature
+
+    def recorder(self):
+        data = command('systemctl', '--user', 'show', 'gpu-screen-recorder.service',
+                       '--property=ActiveState,MainPID').splitlines()
+        props = dict(line.split('=', 1) for line in data if '=' in line)
+        p = process(int(props.get('MainPID', '0')))
+        if props.get('ActiveState') != 'active':
+            raise RuntimeError(f"Replay service is {props.get('ActiveState', 'unknown')}; "
+                               'no changes made. Run game-mode doctor for read-only diagnostics.')
+        if not p:
+            raise RuntimeError(f"Replay service reports MainPID={props.get('MainPID', '0')}, "
+                               'but its process cannot be inspected. Run game-mode doctor in a Hyprland terminal.')
+        a = p['argv']
+        duration = a[a.index('-r') + 1:a.index('-r') + 2] if '-r' in a else []
+        if Path(p['exe']).name != 'gpu-screen-recorder' or duration != ['180']:
+            raise RuntimeError('Running recorder is not verified as a 180-second replay.')
+        if p['state'] in ('T', 't', 'Z'):
+            raise RuntimeError('Recorder is stopped or unavailable.')
+        return identity(p)
+
+    def doctor(self):
+        """Read-only evidence; do not start services or use GSR mutation commands."""
+        report = {'user_id': os.getuid(), 'hyprland_terminal': bool(os.environ.get('HYPRLAND_INSTANCE_SIGNATURE'))}
+        checks = {
+            'service': ('systemctl', '--user', 'show', 'gpu-screen-recorder.service',
+                        '--property=LoadState,ActiveState,SubState,MainPID,Result,FragmentPath,DropInPaths'),
+            'recent_service_log': ('journalctl', '--user', '-u', 'gpu-screen-recorder.service',
+                                   '-n', '12', '--no-pager', '-o', 'cat'),
+        }
+        for name, args in checks.items():
+            try:
+                report[name] = command(*args)
+            except Exception as exc:
+                report[name] = str(exc)
+        candidates = []
+        for root in Path('/proc').iterdir():
+            if not root.name.isdigit():
+                continue
+            try:
+                if root.stat().st_uid != os.getuid():
+                    continue
+                comm = (root / 'comm').read_text().strip()
+                if comm.startswith(('gpu-screen', 'gsr-')):
+                    candidates.append(process(int(root.name)) or {'pid': int(root.name), 'comm': comm,
+                                                                  'issue': 'Process details unreadable'})
+            except OSError:
+                continue
+        report['recorder_processes'] = candidates
+        socket = self.runtime / 'gsr.sock'
+        report['ipc_socket_exists'] = socket.exists()
+        if socket.exists():
+            try:
+                report['ipc_status'] = command('gsr-cli', '-ipc', str(socket), 'status')
+            except Exception as exc:
+                report['ipc_status'] = str(exc)
+        try:
+            report['verified_recorder'] = self.recorder()
+        except Exception as exc:
+            report['verification_issue'] = str(exc)
+        print(json.dumps(report, indent=2))
+
+    def option(self, name):
+        value = json.loads(command('hyprctl', '-j', 'getoption', name))
+        if type(value.get('bool')) is bool:
+            return int(value['bool'])
+        result = value.get('int')
+        if type(result) is not int or result not in (0, 1):
+            raise RuntimeError(f'Unsupported boolean response for {name}: {value}')
+        return result
+
+    def set_option(self, name, value):
+        code = 'true' if value else 'false'
+        for part in reversed(name.split('.')):
+            code = '{' + part + '=' + code + '}'
+        command('hyprctl', 'eval', 'hl.config(' + code + ')')
+        if self.option(name) != value:
+            raise RuntimeError(f'Hyprland did not apply {name}.')
+
+    def visualizer(self, pid):
+        value = command('qs', 'ipc', '--pid', str(pid), 'call', 'desktopVisualizer', 'status')
+        if value not in ('enabled', 'disabled'):
+            raise RuntimeError(f'Unexpected visualizer response: {value}')
+        return value
+
+    def set_visualizer(self, pid, value):
+        if self.visualizer(pid) != value:
+            command('qs', 'ipc', '--pid', str(pid), 'call', 'desktopVisualizer', 'toggle')
+        if self.visualizer(pid) != value:
+            raise RuntimeError('Visualizer verification failed.')
+
+    def same(self, saved):
+        return identity(process(saved['pid'])) == saved
+
+    def stopped(self, saved):
+        p = process(saved['pid'])
+        return bool(p and p['state'] in ('T', 't'))
+
+    def pause(self, saved, stop):
+        # pidfd prevents sending a signal to a reused PID, including between checks.
+        fd = os.pidfd_open(saved['pid'])
+        try:
+            if not self.same(saved) or Path(saved['exe']).name != 'mpvpaper':
+                raise RuntimeError('Wallpaper identity changed; no signal sent.')
+            signal.pidfd_send_signal(fd, signal.SIGSTOP if stop else signal.SIGCONT)
+            for _ in range(20):
+                if not self.same(saved):
+                    raise RuntimeError('Wallpaper exited during operation.')
+                if self.stopped(saved) == stop:
+                    return
+                time.sleep(0.025)
+            raise RuntimeError('Wallpaper signal verification timed out.')
+        finally:
+            os.close(fd)
+
+    def discover(self):
+        entries = []
+        for name in OPTIONS:
+            value = self.option(name)
+            entries.append({'kind': 'option', 'name': name, 'before': value})
+        config = str(Path.home() / '.config/quickshell')
+        matches = []
+        for root in Path('/proc').iterdir():
+            if root.name.isdigit():
+                p = process(int(root.name))
+                if p and Path(p['exe']).name in ('qs', 'quickshell'):
+                    if any(a in (config, config + '/shell.qml') for a in p['argv']):
+                        matches.append(identity(p))
+        if len(matches) != 1:
+            raise RuntimeError('Expected exactly one quickshell process; no changes made.')
+        qs = matches[0]
+        entries.append({'kind': 'visualizer', 'process': qs, 'before': self.visualizer(qs['pid'])})
+        seen = set()
+        for pidfile in sorted((self.runtime / 'qs-wallpaper').glob('*.pid')):
+            p = process(int(pidfile.read_text().strip()))
+            if not p or Path(p['exe']).name != 'mpvpaper':
+                raise RuntimeError(f'Stale or unexpected wallpaper PID file: {pidfile}')
+            if pidfile.stem not in p['argv'] or 'no-audio loop-file=inf' not in p['argv']:
+                raise RuntimeError(f'Wallpaper command does not match inspected launcher: {pidfile}')
+            if p['pid'] not in seen and p['state'] not in ('T', 't'):
+                entries.append({'kind': 'wallpaper', 'process': identity(p)})
+                seen.add(p['pid'])
+        return entries
+
+
+class Controller:
+    def __init__(self, desktop, directory):
+        self.desktop = desktop
+        self.directory = directory
+        self.path = directory / 'state.json'
+
+    def load(self):
+        if not self.path.exists():
+            return None
+        data = json.loads(self.path.read_text())
+        if data.get('version') != 1 or not isinstance(data.get('entries'), list):
+            raise RuntimeError('Invalid journal; preserve it for manual recovery.')
+        for e in data['entries']:
+            if e.get('kind') not in ('option', 'visualizer', 'wallpaper'):
+                raise RuntimeError('Invalid journal entry.')
+            if e['kind'] == 'option' and e.get('name') not in OPTIONS:
+                raise RuntimeError('Invalid journal option.')
+        return data
+
+    def save(self, state):
+        temp = self.directory / 'state.tmp'
+        with temp.open('w') as f:
+            json.dump(state, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp, self.path)
+        fd = os.open(self.directory, os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def guard(self, saved):
+        if self.desktop.recorder() != saved:
+            raise RuntimeError('Recorder identity changed; rolling back desktop changes.')
+
+    def enable(self):
+        existing = self.load()
+        if existing:
+            if existing['phase'] != 'enabled':
+                raise RuntimeError('Recovery pending: run disable first.')
+            self.verify(existing)
+            print('Game Mode already enabled; verified.')
+            return
+        d = self.desktop
+        state = {'version': 1, 'session': d.session(), 'recorder': d.recorder(),
+                 'phase': 'enabling', 'entries': d.discover()}
+        self.guard(state['recorder'])
+        self.save(state)
+        try:
+            for e in state['entries']:
+                self.guard(state['recorder'])
+                if e['kind'] == 'option' and e['before'] == 0:
+                    continue
+                if e['kind'] == 'visualizer' and e['before'] == 'disabled':
+                    continue
+                # Persist intent BEFORE mutation, allowing recovery after SIGKILL.
+                e['attempted'] = True
+                self.save(state)
+                if e['kind'] == 'option':
+                    d.set_option(e['name'], 0)
+                else:
+                    if not d.same(e['process']):
+                        raise RuntimeError('Desktop process changed during enable.')
+                    if e['kind'] == 'visualizer':
+                        d.set_visualizer(e['process']['pid'], 'disabled')
+                    else:
+                        d.pause(e['process'], True)
+                self.guard(state['recorder'])
+            state['phase'] = 'enabled'
+            self.save(state)
+            self.verify(state)
+        except BaseException as original:
+            try:
+                self.disable()
+            except BaseException as recovery:
+                raise RuntimeError(f'{original}; rollback incomplete: {recovery}') from original
+            raise
+        print('Game Mode enabled; 180-second recorder identity unchanged.')
+
+    def verify(self, state):
+        d = self.desktop
+        if state['session'] != d.session():
+            raise RuntimeError('Journal belongs to another session; run disable to clean it.')
+        self.guard(state['recorder'])
+        for e in state['entries']:
+            if e['kind'] == 'option':
+                if d.option(e['name']) != 0:
+                    raise RuntimeError('Settings changed/reloaded; run disable before enabling again.')
+            elif not d.same(e['process']):
+                raise RuntimeError('Desktop process changed; run disable before enabling again.')
+            elif e['kind'] == 'visualizer':
+                if d.visualizer(e['process']['pid']) != 'disabled':
+                    raise RuntimeError('Visualizer changed; run disable before enabling again.')
+            elif not d.stopped(e['process']):
+                raise RuntimeError('Wallpaper resumed; run disable before enabling again.')
+
+    def disable(self):
+        state = self.load()
+        if not state:
+            print('Game Mode already disabled.')
+            return
+        state['phase'] = 'restoring'
+        self.save(state)
+        d = self.desktop
+        failures = []
+        try:
+            same_session = state['session'] == d.session()
+        except Exception:
+            same_session = False
+            # An unavailable current session is different from a confirmed new session.
+            if any(e.get('attempted') and e['kind'] == 'option' for e in state['entries']):
+                failures.append('Hyprland unavailable: option recovery remains pending.')
+        for e in list(reversed(state['entries'])):
+            try:
+                if e.get('attempted'):
+                    if e['kind'] == 'option':
+                        if same_session:
+                            if d.option(e['name']) != e['before']:
+                                d.set_option(e['name'], e['before'])
+                        elif failures:
+                            continue
+                        # Never restore old settings into a confirmed new session.
+                    elif d.same(e['process']):
+                        if e['kind'] == 'visualizer':
+                            d.set_visualizer(e['process']['pid'], e['before'])
+                        elif d.stopped(e['process']):
+                            d.pause(e['process'], False)
+                    # Gone/replaced processes require no restoration; never restart them.
+                state['entries'].remove(e)
+                self.save(state)
+            except Exception as exc:
+                failures.append(str(exc))
+        if state['entries']:
+            raise RuntimeError('Recovery pending; retry disable. ' + '; '.join(failures))
+        self.path.unlink()
+        print('Game Mode disabled; captured desktop state restored.')
+
+    def status(self):
+        state = self.load()
+        result = {'mode': 'disabled' if not state else state['phase']}
+        if state:
+            result['resources'] = state['entries']
+        try:
+            result['options'] = {name: self.desktop.option(name) for name in OPTIONS}
+            result['recorder'] = self.desktop.recorder()
+            result['replay_seconds'] = 180
+            if state:
+                self.verify(state)
+                result['verified'] = state['phase'] == 'enabled'
+        except Exception as exc:
+            result['verified'] = False
+            result['issue'] = str(exc)
+        print(json.dumps(result, indent=2))
+        return 0 if result.get('verified', True) else 1
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=('enable', 'disable', 'status', 'doctor'))
+    args = parser.parse_args()
+    if os.getuid() == 0:
+        parser.error('Run as your desktop user, without sudo.')
+    os.umask(0o077)
+    runtime = Path(os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}'))
+    if args.action == 'doctor':
+        return Desktop(runtime).doctor()
+    if runtime.stat().st_uid != os.getuid() or runtime.is_symlink():
+        raise RuntimeError('Runtime directory must belong to your user and not be a symlink.')
+    directory = runtime / 'terminal-game-mode'
+    directory.mkdir(mode=0o700, exist_ok=True)
+    if directory.is_symlink() or directory.stat().st_uid != os.getuid() or directory.stat().st_mode & 0o077:
+        raise RuntimeError('Unsafe Game Mode state directory.')
+    with (directory / 'lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        controller = Controller(Desktop(runtime), directory)
+        def interrupted(signum, frame):
+            raise KeyboardInterrupt(f'Interrupted by signal {signum}')
+        signal.signal(signal.SIGTERM, interrupted)
+        return getattr(controller, args.action)() or 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (Exception, KeyboardInterrupt) as exc:
+        print(f'game-mode: {exc}', file=sys.stderr)
+        sys.exit(1)

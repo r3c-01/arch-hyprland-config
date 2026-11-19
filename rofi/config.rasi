@@ -1,0 +1,16 @@
+configuration {
+    modes: "drun,run,window";
+    terminal: "kitty";
+    show-icons: true;
+    timeout {
+        action: "kb-cancel";
+        delay: 0;
+    }
+    filebrowser {
+        directories-first: true;
+        sorting-method: "name";
+    }
+}
+
+// Resolve relative to this config; do not use shell variable expansion in Rasi.
+@theme "themes/squared-nord.rasi"

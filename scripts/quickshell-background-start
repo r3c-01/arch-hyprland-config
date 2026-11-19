@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+for name in quickshell-caffeine quickshell-activity; do
+    config="$HOME/.config/$name"
+
+    if [[ ! -f "$config/shell.qml" ]]; then
+        echo "Missing configuration: $config" >&2
+        continue
+    fi
+
+    if qs list -p "$config" 2>/dev/null | grep -q '^Instance '; then
+        echo "$name: already running"
+    else
+        echo "$name: starting"
+        qs -n -d -p "$config"
+    fi
+done

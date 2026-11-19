@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+dir="$HOME/Pictures/Screenshots"
+mkdir -p "$dir"
+
+file="$dir/$(date +'%Y-%m-%d_%H-%M-%S').png"
+
+# Capture all outputs, or select one with SCREENSHOT_OUTPUT.
+if [[ -n "${SCREENSHOT_OUTPUT:-}" ]]; then
+    grim -o "$SCREENSHOT_OUTPUT" "$file"
+else
+    grim "$file"
+fi
+
+# Copy the image to the clipboard
+wl-copy --type image/png < "$file"
+
+# Show confirmation
+notify-send -a "Screenshot" \
+    -i camera-photo \
+    "Screenshot saved" \
+    "$(basename "$file")"

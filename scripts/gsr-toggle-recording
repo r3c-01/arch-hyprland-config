@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+
+runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+socket="$runtime/gsr.sock"
+
+# Prevent overlapping hotkey presses
+exec 9>"$runtime/gsr-toggle.lock"
+flock -n 9 || exit 0
+
+gsr=(gsr-cli -ipc "$socket")
+
+if ! "${gsr[@]}" status >/dev/null 2>&1; then
+    notify-send -u critical "Recording unavailable" \
+        "GPU Screen Recorder is not running"
+    exit 1
+fi
+
+# Stop an active recording and wait for the saved file
+if file=$("${gsr[@]}" stop-replay-recording 2>/dev/null); then
+    notify-send -a "GPU Screen Recorder" \
+        -i video-x-generic \
+        "Recording stopped" \
+        "Saved: $(basename "$file")"
+
+# Otherwise start a new recording
+elif "${gsr[@]}" start-replay-recording >/dev/null 2>&1; then
+    notify-send -a "GPU Screen Recorder" \
+        -i media-record \
+        "Recording started" \
+        "Using the running recorder configuration"
+
+else
+    notify-send -u critical \
+        "Recording error" \
+        "Could not change recording state"
+    exit 1
+fi

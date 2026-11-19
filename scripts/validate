@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Offline, non-mutating source validation. Run from any directory; no desktop actions."""
+import ast
+import os
+import re
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def main():
+    failures, skipped, counts = [], [], {}
+    qmlformat = shutil.which('qmlformat6')
+    if not qmlformat and Path('/usr/lib/qt6/bin/qmlformat').is_file():
+        qmlformat = '/usr/lib/qt6/bin/qmlformat'
+    luac = shutil.which('luac')
+    for p in sorted(ROOT.rglob('*')):
+        relative = p.relative_to(ROOT)
+        if any(part in ('work', '.git', '__pycache__') for part in relative.parts):
+            continue
+        if p.is_symlink():
+            failures.append(f'{relative}: symlink requires review')
+            continue
+        if not p.is_file():
+            continue
+        if relative.as_posix() in ('hypr/scheme/current.lua', 'quickshell-control/scripts/sysmon.sh'):
+            failures.append(f'{relative}: excluded unverified material reintroduced')
+            continue
+        if relative.parts[:2] == ('quickshell-control', 'ui'):
+            failures.append(f'{relative}: excluded library reintroduced into release tree')
+            continue
+        data = p.read_bytes()
+        kind, command = None, None
+        try:
+            if p.suffix == '.py' or data.startswith(b'#!/usr/bin/env python3'):
+                kind = 'Python'
+                ast.parse(data, filename=str(relative))
+            elif p.suffix == '.lua':
+                kind = 'Lua'
+                command = [luac, '-p', str(p)] if luac else None
+            elif p.suffix == '.qml':
+                text = data.decode('utf-8')
+                # This library has been excluded; flag both type and path references.
+                if re.search(r'\b(?:Ind(?:Btn|Chip|Field|FilePreview|Kpi|Label|Panel|Rule|Spark|Table|Text|Toggle)|Tok)\b|quickshell-control/ui|[\"\'](?:[^\"\']*/)?ui(?:/[^\"\']*)?[\"\']', text):
+                    failures.append(f'{relative}: reference to excluded UI library')
+                kind = 'QML (Qt 6 parser)'
+                command = [qmlformat, str(p)] if qmlformat else None
+            elif p.suffix == '.sh' or data.startswith((b'#!/usr/bin/env bash', b'#!/bin/bash', b'#!/bin/sh')):
+                kind = 'Shell'
+                command = ['bash', '-n', str(p)]
+            elif p.suffix == '.svg':
+                kind = 'SVG XML'
+                ET.fromstring(data)
+            if command:
+                result = subprocess.run(command, cwd=ROOT, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.PIPE, text=True, timeout=30,
+                                        env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
+                if result.returncode:
+                    failures.append(f'{relative}: {result.stderr.strip()}')
+            elif kind in ('Lua', 'QML (Qt 6 parser)'):
+                skipped.append(f'{relative}: validator unavailable')
+            if kind:
+                counts[kind] = counts.get(kind, 0) + 1
+        except (SyntaxError, ET.ParseError, OSError, subprocess.TimeoutExpired) as error:
+            failures.append(f'{relative}: {error}')
+    for kind, count in counts.items():
+        print(f'{kind}: {count} checked')
+    for message in skipped:
+        print('SKIP:', message)
+    for message in failures:
+        print('FAIL:', message)
+    print(f'{len(failures)} failures; {len(skipped)} skipped. Runtime behavior is not tested.')
+    return 1 if failures else 2 if skipped else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

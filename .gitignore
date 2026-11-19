@@ -1,0 +1,60 @@
+# Personal configuration and runtime data
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+/private/
+/personal/
+/local/
+.config/
+.cache/
+.local/
+**/activity.json
+**/tasks.json
+**/state.json
+**/appearance.json
+/hypr/wallpaper.*
+
+# Generated outputs, recordings, archives, and local validation scratch
+/work/
+__pycache__/
+*.py[cod]
+*.log
+*.pid
+*.sock
+*.bak
+*.backup
+*~
+*.swp
+*.swo
+.DS_Store
+*.zip
+*.tar
+*.tar.gz
+*.mp4
+*.mkv
+*.webm
+*.wav
+
+# Screenshots require explicit privacy review before inclusion
+/screenshots/*
+!/screenshots/README.md
+
+# Local tool/account metadata
+/.aws/
+/.codex/
+/.agents/
+
+# Unused library excluded from the intended public source tree
+/quickshell-control/ui/
+
+# Unreferenced palette with unverified provenance
+/hypr/scheme/current.lua
+
+# Unused sampler identifying another shell, with unverified ownership
+/quickshell-control/scripts/sysmon.sh

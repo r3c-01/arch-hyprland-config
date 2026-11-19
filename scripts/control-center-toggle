@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+config="$HOME/.config/quickshell-control"
+
+if [[ ! -f "$config/shell.qml" ]]; then
+    echo "Control center configuration missing" >&2
+    exit 1
+fi
+
+instances="$(qs list -p "$config")"
+
+if grep -q '^Instance ' <<< "$instances"; then
+    exec qs kill -p "$config"
+else
+    exec qs -n -d -p "$config"
+fi

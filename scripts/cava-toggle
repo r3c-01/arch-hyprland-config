@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+pid=$(hyprctl clients -j | jq -r '
+  .[] | select(.class == "cava-glass") | .pid
+' | head -n 1)
+
+if [[ -n "$pid" ]]; then
+    kill "$pid"
+else
+    nohup kitty \
+        --class cava-glass \
+        --title cava-glass \
+        -o background_opacity=0.50 \
+        -o hide_window_decorations=yes \
+        cava -p "$HOME/.config/cava/cyberglass.conf" \
+        >/dev/null 2>&1 &
+fi
